@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+
 DEBUG = False
 RESET_REQUESTED = False
 RESET_BTN = {"x": 20, "y": 0, "w": 160, "h": 55}  # y will be set once we know image height
@@ -68,8 +69,6 @@ def four_point_warp(image, pts):
     return cv2.warpPerspective(image, M, (maxW, maxH))
 
 def find_screen(frame):
-    import cv2
-    import numpy as np
 
     h, w = frame.shape[:2]
 
@@ -197,137 +196,8 @@ def find_screen(frame):
 
     return best
 
-def detect_tiles(warped_bgr):
-    import cv2
-    import numpy as np
-
-    H, W = warped_bgr.shape[:2]
-    hsv = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2HSV)
-
-    # --- 1) Segment "purple-ish" regions ---
-    # These ranges are a starting point. We'll tune them with the debug windows below.
-    # Purple hue often sits roughly around 120-170 in OpenCV HSV (0-179 scale),
-    # but your purple may vary. Start broad and tighten later.
-    lower = np.array([110, 40, 40], dtype=np.uint8)
-    upper = np.array([175, 255, 255], dtype=np.uint8)
-    mask = cv2.inRange(hsv, lower, upper)
-
-    # Remove tiny specks and fill holes inside tiles
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=2)
-
-    # Debug: see what your "purple" mask looks like
-    if DEBUG:
-        cv2.imshow("tile purple mask", mask)
-
-    # --- 2) Find candidate blobs ---
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates = []
-    for c in cnts:
-        area = cv2.contourArea(c)
-        if area < (H * W) * 0.001:   # too small
-            continue
-        if area > (H * W) * 0.20:    # too large
-            continue
-
-        x, y, w, h = cv2.boundingRect(c)
-
-        # square-ish filter (stronger than before)
-        ar = w / float(h + 1e-6)
-        if ar < 0.90 or ar > 1.10:
-            continue
-
-        # fill ratio: contour should occupy much of its bounding box
-        fill = area / float(w * h + 1e-6)
-        if fill < 0.55:
-            continue
-
-        candidates.append((x, y, w, h))
-
-    if not candidates:
-        return []
-
-    # --- 3) Same-size-per-level constraint: keep the dominant size cluster ---
-    sizes = np.array([min(w, h) for (x, y, w, h) in candidates], dtype=np.float32)
-    bin_size = 6
-    bins = np.round(sizes / bin_size) * bin_size
-    unique, counts = np.unique(bins, return_counts=True)
-    dominant = unique[np.argmax(counts)]
-
-    filtered = []
-    for (x, y, w, h), b in zip(candidates, bins):
-        if abs(b - dominant) <= bin_size:
-            filtered.append((x, y, w, h))
-
-    if not filtered:
-        return []
-
-    # --- 4) Border ring check: outside should be darker than inside ---
-    # This rejects many UI elements and especially circles without dark outlines.
-    v = hsv[:, :, 2].astype(np.float32)  # brightness
-    kept = []
-    pad = 3  # border thickness to sample (tune 2-6)
-
-    for (x, y, w, h) in filtered:
-        # Clamp
-        x0 = max(0, x)
-        y0 = max(0, y)
-        x1 = min(W, x + w)
-        y1 = min(H, y + h)
-
-        # Inner region
-        inner = v[y0:y1, x0:x1]
-        if inner.size < 50:
-            continue
-        inner_mean = float(np.mean(inner))
-
-        # Outer ring region (a slightly expanded box minus the inner box)
-        ox0 = max(0, x0 - pad)
-        oy0 = max(0, y0 - pad)
-        ox1 = min(W, x1 + pad)
-        oy1 = min(H, y1 + pad)
-
-        outer = v[oy0:oy1, ox0:ox1].copy()
-        # zero-out inner area so only the ring remains
-        outer[(y0 - oy0):(y1 - oy0), (x0 - ox0):(x1 - ox0)] = np.nan
-        ring_mean = float(np.nanmean(outer))
-
-        # We expect ring to be darker => lower brightness
-        # Tune this threshold based on your art. Start around 8–20.
-        if (inner_mean - ring_mean) > 10:
-            kept.append((x, y, w, h))
-
-    if not kept:
-        # if border is subtle, still return filtered (so you can see boxes)
-        kept = filtered
-
-    # --- 5) NMS-lite dedupe overlaps ---
-    kept = sorted(kept, key=lambda r: r[2] * r[3], reverse=True)
-
-    def iou(a, b):
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        x1 = max(ax, bx)
-        y1 = max(ay, by)
-        x2 = min(ax + aw, bx + bw)
-        y2 = min(ay + ah, by + bh)
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        union = aw * ah + bw * bh - inter + 1e-6
-        return inter / union
-
-    final = []
-    for r in kept:
-        if all(iou(r, k) < 0.2 for k in final):
-            final.append(r)
-
-    final.sort(key=lambda r: (r[1], r[0]))
-    return final
 
 def detect_spiral_centers(warped_bgr):
-    import cv2
-    import numpy as np
 
     gray = cv2.cvtColor(warped_bgr, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -488,8 +358,6 @@ def draw_reset_button(img):
 
 
 if __name__ == "__main__":
-    import cv2
-    import numpy as np
 
     WINDOW_NAME = "MSM Memory Solver"
     cv2.namedWindow(WINDOW_NAME)

@@ -10,6 +10,30 @@ TILE_BACK_BASELINE = None    # list[float] baseline score per tile when back sid
 TILE_STATE = None            # list[bool] True if tile is FRONT
 FACE_SNAPSHOT = {}   # tile_idx -> BGR image crop (face)
 FACE_READY = set()   # tile_idx set for which we've captured face this flip
+FACE_HASH = {}          # tile_idx -> 64-bit hash (int)
+TILE_ID = {}            # tile_idx -> identity id (int)
+ID_COLOR = {}           # identity id -> BGR color
+NEXT_ID = {"value": 1}             # identity counter
+CAPTURE_DELAY = {}  # tile_idx -> frames remaining before capture
+
+
+def sanitize_boxes(boxes):
+    clean = []
+    for (x, y, w, h) in boxes:
+        clean.append((int(round(x)), int(round(y)), int(round(w)), int(round(h))))
+    return clean
+
+def normalize_face(face):
+    gray = cv2.cvtColor(face, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, (64, 64))
+
+    # Remove lighting differences
+    gray = cv2.equalizeHist(gray)
+
+    # Kill high-frequency autofocus noise
+    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    return gray
 
 
 def tile_edge_score(warped_bgr, box):
@@ -42,10 +66,54 @@ def crop_tile_face(warped_bgr, box, pad_frac=0.12):
         return roi
     return roi[pad:h-pad, pad:w-pad]
 
+def dhash64(img, hash_size=8):
+    """
+    Accepts either BGR (3-ch) or grayscale (1-ch) image.
+    Returns a 64-bit dHash as Python int.
+    """
+    if img is None or img.size == 0:
+        return 0
 
-#def init_tile_baseline(warped_bgr, boxes):
-    # Baseline score for back-side (spiral showing)
-    #return [tile_edge_score(warped_bgr, b) for b in boxes]
+    # If already grayscale, use it directly
+    if len(img.shape) == 2:
+        gray = img
+    else:
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Resize to (hash_size+1, hash_size) so we can diff adjacent columns
+    small = cv2.resize(gray, (hash_size + 1, hash_size), interpolation=cv2.INTER_AREA)
+    diff = small[:, 1:] > small[:, :-1]
+
+    h = 0
+    for bit in diff.flatten():
+        h = (h << 1) | int(bit)
+    return h
+
+
+def hamming64(a, b):
+    return (a ^ b).bit_count()
+
+def deterministic_color(idx):
+    # nice bright-ish deterministic BGR
+    rng = np.random.default_rng(idx)
+    c = rng.integers(low=60, high=255, size=3, dtype=np.int32)
+    return (int(c[0]), int(c[1]), int(c[2]))  # BGR
+
+def match_identity(new_hash, existing_hash_by_tile, max_dist=10):
+    """
+    Returns (matched_tile_idx, dist) or (None, None)
+    """
+    best_tile = None
+    best_d = 1e9
+    for ti, h in existing_hash_by_tile.items():
+        d = hamming64(new_hash, h)
+        if d < best_d:
+            best_d = d
+            best_tile = ti
+    if best_d <= max_dist:
+        return best_tile, best_d
+    return None, None
+
 
 def init_tile_baseline(warped_bgr, boxes):
     return [tile_flip_score(warped_bgr, b) for b in boxes]
@@ -275,7 +343,7 @@ def detect_spiral_centers(warped_bgr):
 def filter_ui_regions(centers, H, W):
     filtered = []
     for cx, cy, rw, rh in centers:
-        if cy < 0.18 * H:       # top 18%
+        if cy < 0.2 * H:       # top 18%
             continue
         if cy > 0.92 * H:       # bottom 8%
             continue
@@ -488,13 +556,20 @@ if __name__ == "__main__":
 
                     # Only lock if it looks like a real level (at least 2 tiles)
                     if len(boxes) >= 2:
-                        LOCKED_BOXES = boxes
+                        LOCKED_BOXES = sanitize_boxes(boxes)
                         TILE_BACK_BASELINE = init_tile_baseline(warped, LOCKED_BOXES)
                         TILE_STATE = [False] * len(LOCKED_BOXES)  # False=BACK, True=FRONT
+                        CAPTURE_DELAY.clear()
+                        CAPTURE_DELAY.update({i: 0 for i in range(len(LOCKED_BOXES))})
+
+
                 else:
                     boxes = LOCKED_BOXES
 
                 output = warped.copy()
+                overlay = output.copy()
+                alpha = 0.70
+
 
                 # Draw boxes and detect flips if we are locked
                 if LOCKED_BOXES is not None:
@@ -508,9 +583,15 @@ if __name__ == "__main__":
                     max_base = 0.0
 
                     for i, b in enumerate(LOCKED_BOXES):
-                        x, y, w, h = b
+                        #x, y, w, h = b
+                        x, y, w, h = map(int, map(round, b))
+                        # If tile has an identity, paint overlay
+                        if i in TILE_ID:
+                            tid = TILE_ID[i]
+                            color = ID_COLOR.get(tid, (0, 255, 0))
+                            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
 
-                        #score = tile_edge_score(warped, b)
+
                         score = tile_flip_score(warped, b)
                         base = TILE_BACK_BASELINE[i]
 
@@ -520,24 +601,51 @@ if __name__ == "__main__":
                             max_i = i
                             max_score = score
                             max_base = base
+                        
+                        DELAY_FRAMES = 4  # put this OUTSIDE the loop if you want, but ok here
 
-                        # Flip detection with hysteresis
-                        if TILE_STATE[i] is False:
-                            if score > base + BACK_TO_FRONT_DELTA:
-                                TILE_STATE[i] = True
+                        # --- BACK -> FRONT transition ---
+                        if TILE_STATE[i] is False and score > base + BACK_TO_FRONT_DELTA:
+                            TILE_STATE[i] = True
+                            CAPTURE_DELAY[i] = DELAY_FRAMES  # start delay timer
 
-                                # v2a: capture face snapshot on flip-up (once)
-                                if i not in FACE_READY:
-                                    face = crop_tile_face(warped, b)
-                                    if face is not None:
-                                        FACE_SNAPSHOT[i] = face
-                                        FACE_READY.add(i)
+                        # --- FRONT -> BACK transition ---
+                        if TILE_STATE[i] is True:
+                            # Only allow FRONT -> BACK if we already captured
+                            if i in FACE_READY:
+                                if score < base + FRONT_TO_BACK_DELTA:
+                                    TILE_STATE[i] = False
+                                    FACE_READY.discard(i)
+                                    CAPTURE_DELAY[i] = 0
 
-                        else:
-                            # FRONT -> BACK
-                            if score < base + FRONT_TO_BACK_DELTA:
-                                TILE_STATE[i] = False
-                                FACE_READY.discard(i)
+                        # --- If tile is FRONT, count down then capture once ---
+                        if TILE_STATE[i] is True and i not in FACE_READY:
+                            if CAPTURE_DELAY.get(i, 0) > 0:
+                                CAPTURE_DELAY[i] -= 1
+                            else:
+                                face = crop_tile_face(warped, b)
+                                if face is not None:
+                                    FACE_SNAPSHOT[i] = face
+                                    FACE_READY.add(i)
+
+                                    # v2b: hash + identity assignment
+                                    #h = dhash64(face)
+                                    norm = normalize_face(face)
+                                    h = dhash64(norm)
+
+                                    FACE_HASH[i] = h
+
+                                    existing = {k: v for k, v in FACE_HASH.items() if k != i}
+                                    matched_tile, dist = match_identity(h, existing, max_dist=10)
+
+                                    if matched_tile is not None and matched_tile in TILE_ID:
+                                        TILE_ID[i] = TILE_ID[matched_tile]
+                                    else:
+                                        tid = NEXT_ID["value"]
+                                        NEXT_ID["value"] += 1
+                                        TILE_ID[i] = tid
+                                        ID_COLOR[tid] = deterministic_color(tid)
+
 
 
                         # Slowly adapt baseline only when we believe it's BACK
@@ -545,7 +653,10 @@ if __name__ == "__main__":
                             TILE_BACK_BASELINE[i] = 0.9 * base + 0.1 * score
 
                         # Draw tile box
+                        #cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                        x, y, w, h = map(int, map(round, b))
                         cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
 
                         # If flipped, draw the tile index label
                         if TILE_STATE[i]:
@@ -563,6 +674,9 @@ if __name__ == "__main__":
 
                     cv2.putText(output, f"tiles={len(LOCKED_BOXES)}  locked=YES",
                                 (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                    output = cv2.addWeighted(overlay, alpha, output, 1 - alpha, 0)
+
                 else:
                     # Not locked yet (still searching for tiles)
                     cv2.putText(output, "Looking for tiles (show spirals)...",
@@ -588,6 +702,15 @@ if __name__ == "__main__":
             TILE_STATE = None
             FACE_SNAPSHOT.clear()
             FACE_READY.clear()
+
+            FACE_HASH.clear()
+            TILE_ID.clear()
+            ID_COLOR.clear()
+            NEXT_ID["value"] = 1
+            CAPTURE_DELAY.clear()
+
+
+
 
 
             cv2.putText(output, "RESET!", (20, 80),

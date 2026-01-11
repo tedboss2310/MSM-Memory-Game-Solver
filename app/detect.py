@@ -5,6 +5,38 @@ DEBUG = False
 RESET_REQUESTED = False
 RESET_BTN = {"x": 20, "y": 0, "w": 160, "h": 55}  # y will be set once we know image height
 
+LOCKED_BOXES = None          # list[(x,y,w,h)] once per level
+TILE_BACK_BASELINE = None    # list[float] baseline score per tile when back side is showing
+TILE_STATE = None            # list[bool] True if tile is FRONT
+
+def tile_edge_score(warped_bgr, box):
+    x, y, w, h = box
+    roi = warped_bgr[y:y+h, x:x+w]
+    if roi.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(gray, 60, 160)
+    return float(np.mean(edges))  # 0..255 (ish)
+
+def tile_flip_score(warped_bgr, box):
+    x, y, w, h = box
+    roi = warped_bgr[y:y+h, x:x+w]
+    if roi.size == 0:
+        return 0.0
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    v = hsv[:, :, 2].astype(np.float32)
+    return float(np.std(v))  # higher = more detail/variation
+
+
+#def init_tile_baseline(warped_bgr, boxes):
+    # Baseline score for back-side (spiral showing)
+    #return [tile_edge_score(warped_bgr, b) for b in boxes]
+
+def init_tile_baseline(warped_bgr, boxes):
+    return [tile_flip_score(warped_bgr, b) for b in boxes]
+
+
 def order_points(pts):
     # pts: (4,2)
     rect = np.zeros((4, 2), dtype="float32")
@@ -339,6 +371,7 @@ def on_mouse(event, x, y, flags, param):
         if bx <= x <= bx + bw and by <= y <= by + bh:
             RESET_REQUESTED = True
 
+
 def draw_reset_button(img):
     global RESET_BTN
     H, W = img.shape[:2]
@@ -362,6 +395,7 @@ if __name__ == "__main__":
     WINDOW_NAME = "MSM Memory Solver"
     cv2.namedWindow(WINDOW_NAME)
     cv2.setMouseCallback(WINDOW_NAME, on_mouse)
+    # global LOCKED_BOXES, TILE_BACK_BASELINE, TILE_STATE
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -432,25 +466,82 @@ if __name__ == "__main__":
 
             warped = four_point_warp(frame, last_ord)
             if warped is not None:
-                boxes, spirals, tile_size = detect_tiles_via_spirals(warped)
+                #global LOCKED_BOXES, TILE_BACK_BASELINE, TILE_STATE
+
+                # If we haven't locked boxes yet, detect them now (spirals visible at start of level)
+                if LOCKED_BOXES is None:
+                    boxes, spirals, tile_size = detect_tiles_via_spirals(warped)
+
+                    # Only lock if it looks like a real level (at least 2 tiles)
+                    if len(boxes) >= 2:
+                        LOCKED_BOXES = boxes
+                        TILE_BACK_BASELINE = init_tile_baseline(warped, LOCKED_BOXES)
+                        TILE_STATE = [False] * len(LOCKED_BOXES)  # False=BACK, True=FRONT
+                else:
+                    boxes = LOCKED_BOXES
 
                 output = warped.copy()
 
-                # Draw tile boxes (green). In normal mode, don't draw spiral dots.
-                for (x, y, w, h) in boxes:
-                    cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                # Draw boxes and detect flips if we are locked
+                if LOCKED_BOXES is not None:
+                    # Tune these (hysteresis prevents flicker)
+                    BACK_TO_FRONT_DELTA = 6.0
+                    FRONT_TO_BACK_DELTA = 3.5
 
-                # If you want spiral dots only in DEBUG:
-                if DEBUG:
-                    for cx, cy, rw, rh in spirals:
-                        cv2.circle(output, (int(cx), int(cy)), 6, (0, 255, 255), -1)
+                    max_delta = -1e9
+                    max_i = -1
+                    max_score = 0.0
+                    max_base = 0.0
 
-                # Small HUD
-                cv2.putText(output, f"tiles={len(boxes)}", (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                    for i, b in enumerate(LOCKED_BOXES):
+                        x, y, w, h = b
 
-                # Draw the Reset button (bottom-left)
+                        #score = tile_edge_score(warped, b)
+                        score = tile_flip_score(warped, b)
+                        base = TILE_BACK_BASELINE[i]
+
+                        delta = score - base
+                        if delta > max_delta:
+                            max_delta = delta
+                            max_i = i
+                            max_score = score
+                            max_base = base
+
+                        # Flip detection with hysteresis
+                        if TILE_STATE[i] is False:
+                            # BACK -> FRONT
+                            if score > base + BACK_TO_FRONT_DELTA:
+                                TILE_STATE[i] = True
+                        else:
+                            # FRONT -> BACK
+                            if score < base + FRONT_TO_BACK_DELTA:
+                                TILE_STATE[i] = False
+
+                        # Slowly adapt baseline only when we believe it's BACK
+                        if TILE_STATE[i] is False:
+                            TILE_BACK_BASELINE[i] = 0.9 * base + 0.1 * score
+
+                        # Draw tile box
+                        cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                        # If flipped, draw the tile index label
+                        if TILE_STATE[i]:
+                            cv2.putText(output, f"{i}", (x + 10, y + 35),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
+                    
+                    cv2.putText(output, f"maxΔ={max_delta:.1f} tile={max_i} s={max_score:.1f} b={max_base:.1f}",
+                                (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                    cv2.putText(output, f"tiles={len(LOCKED_BOXES)}  locked=YES",
+                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+                else:
+                    # Not locked yet (still searching for tiles)
+                    cv2.putText(output, "Looking for tiles (show spirals)...",
+                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                # Draw Reset button
                 draw_reset_button(output)
+
 
         # Handle reset click (keep the callback dumb; do the work here)
         if RESET_REQUESTED:
@@ -462,6 +553,10 @@ if __name__ == "__main__":
             # (Optional) also drop tracking so it reacquires iPad
             # last_pts = None
             # lost_frames = 0
+            # UNLOCK tile tracking for next level
+            LOCKED_BOXES = None
+            TILE_BACK_BASELINE = None
+            TILE_STATE = None
 
             cv2.putText(output, "RESET!", (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)

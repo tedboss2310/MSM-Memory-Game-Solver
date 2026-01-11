@@ -8,6 +8,9 @@ RESET_BTN = {"x": 20, "y": 0, "w": 160, "h": 55}  # y will be set once we know i
 LOCKED_BOXES = None          # list[(x,y,w,h)] once per level
 TILE_BACK_BASELINE = None    # list[float] baseline score per tile when back side is showing
 TILE_STATE = None            # list[bool] True if tile is FRONT
+FACE_SNAPSHOT = {}   # tile_idx -> BGR image crop (face)
+FACE_READY = set()   # tile_idx set for which we've captured face this flip
+
 
 def tile_edge_score(warped_bgr, box):
     x, y, w, h = box
@@ -27,6 +30,17 @@ def tile_flip_score(warped_bgr, box):
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     v = hsv[:, :, 2].astype(np.float32)
     return float(np.std(v))  # higher = more detail/variation
+
+def crop_tile_face(warped_bgr, box, pad_frac=0.12):
+    x, y, w, h = box
+    roi = warped_bgr[y:y+h, x:x+w]
+    if roi.size == 0:
+        return None
+
+    pad = int(min(w, h) * pad_frac)
+    if (w - 2*pad) < 10 or (h - 2*pad) < 10:
+        return roi
+    return roi[pad:h-pad, pad:w-pad]
 
 
 #def init_tile_baseline(warped_bgr, boxes):
@@ -509,13 +523,22 @@ if __name__ == "__main__":
 
                         # Flip detection with hysteresis
                         if TILE_STATE[i] is False:
-                            # BACK -> FRONT
                             if score > base + BACK_TO_FRONT_DELTA:
                                 TILE_STATE[i] = True
+
+                                # v2a: capture face snapshot on flip-up (once)
+                                if i not in FACE_READY:
+                                    face = crop_tile_face(warped, b)
+                                    if face is not None:
+                                        FACE_SNAPSHOT[i] = face
+                                        FACE_READY.add(i)
+
                         else:
                             # FRONT -> BACK
                             if score < base + FRONT_TO_BACK_DELTA:
                                 TILE_STATE[i] = False
+                                FACE_READY.discard(i)
+
 
                         # Slowly adapt baseline only when we believe it's BACK
                         if TILE_STATE[i] is False:
@@ -528,7 +551,13 @@ if __name__ == "__main__":
                         if TILE_STATE[i]:
                             cv2.putText(output, f"{i}", (x + 10, y + 35),
                                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 255), 3)
-                    
+                            if i in FACE_SNAPSHOT:
+                                cv2.putText(output, "S", (x + w - 25, y + 30),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
+                           
+                    cv2.putText(output, f"saved={len(FACE_SNAPSHOT)}",
+                                (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+
                     cv2.putText(output, f"maxΔ={max_delta:.1f} tile={max_i} s={max_score:.1f} b={max_base:.1f}",
                                 (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
@@ -557,6 +586,9 @@ if __name__ == "__main__":
             LOCKED_BOXES = None
             TILE_BACK_BASELINE = None
             TILE_STATE = None
+            FACE_SNAPSHOT.clear()
+            FACE_READY.clear()
+
 
             cv2.putText(output, "RESET!", (20, 80),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)

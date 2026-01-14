@@ -2,8 +2,22 @@ import cv2
 import numpy as np
 
 DEBUG = False
-RESET_REQUESTED = False
-RESET_BTN = {"x": 20, "y": 0, "w": 160, "h": 55}  # y will be set once we know image height
+
+# UI State Machine: CONFIRMING -> SEARCHING -> READY -> RUNNING
+UI_STATE = "CONFIRMING"  # "CONFIRMING", "SEARCHING", "READY", "RUNNING"
+START_REQUESTED = False
+STOP_REQUESTED = False
+YES_REQUESTED = False
+NO_REQUESTED = False
+
+# Frozen quad - locked iPad position after user confirms
+FROZEN_QUAD = None
+
+# Smaller buttons (w=100, h=40 instead of w=160, h=55)
+START_BTN = {"x": 20, "y": 0, "w": 100, "h": 40}
+STOP_BTN = {"x": 20, "y": 0, "w": 100, "h": 40}
+YES_BTN = {"x": 0, "y": 0, "w": 80, "h": 40}
+NO_BTN = {"x": 0, "y": 0, "w": 80, "h": 40}
 
 LOCKED_BOXES = None          # list[(x,y,w,h)] once per level
 TILE_BACK_BASELINE = None    # list[float] baseline score per tile when back side is showing
@@ -46,9 +60,27 @@ def tile_edge_score(warped_bgr, box):
     edges = cv2.Canny(gray, 60, 160)
     return float(np.mean(edges))  # 0..255 (ish)
 
-def tile_flip_score(warped_bgr, box):
+def tile_flip_score(warped_bgr, box, pad_frac=0.10):
+    """
+    Calculate flip score using inner portion of tile.
+    pad_frac=0.10 means 10% padding on each side, using ~80% of the box.
+    This helps when bounding boxes are slightly larger than actual tiles.
+    """
     x, y, w, h = box
-    roi = warped_bgr[y:y+h, x:x+w]
+
+    # Apply padding to focus on inner tile area
+    pad_x = int(w * pad_frac)
+    pad_y = int(h * pad_frac)
+
+    x1 = x + pad_x
+    y1 = y + pad_y
+    x2 = x + w - pad_x
+    y2 = y + h - pad_y
+
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    roi = warped_bgr[y1:y2, x1:x2]
     if roi.size == 0:
         return 0.0
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -343,7 +375,7 @@ def detect_spiral_centers(warped_bgr):
 def filter_ui_regions(centers, H, W):
     filtered = []
     for cx, cy, rw, rh in centers:
-        if cy < 0.2 * H:       # top 18%
+        if cy < 0.20 * H:       # top 18%
             continue
         if cy > 0.92 * H:       # bottom 8%
             continue
@@ -447,29 +479,149 @@ def detect_tiles_via_spirals(warped_bgr):
     return boxes, spirals, tile_size
 
 def on_mouse(event, x, y, flags, param):
-    global RESET_REQUESTED, RESET_BTN
+    global START_REQUESTED, STOP_REQUESTED, YES_REQUESTED, NO_REQUESTED, UI_STATE
     if event == cv2.EVENT_LBUTTONDOWN:
-        bx, by, bw, bh = RESET_BTN["x"], RESET_BTN["y"], RESET_BTN["w"], RESET_BTN["h"]
-        if bx <= x <= bx + bw and by <= y <= by + bh:
-            RESET_REQUESTED = True
+        if UI_STATE == "CONFIRMING":
+            # Check Yes button
+            bx, by, bw, bh = YES_BTN["x"], YES_BTN["y"], YES_BTN["w"], YES_BTN["h"]
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                YES_REQUESTED = True
+            # Check No button
+            bx, by, bw, bh = NO_BTN["x"], NO_BTN["y"], NO_BTN["w"], NO_BTN["h"]
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                NO_REQUESTED = True
+        elif UI_STATE == "READY":
+            bx, by, bw, bh = START_BTN["x"], START_BTN["y"], START_BTN["w"], START_BTN["h"]
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                START_REQUESTED = True
+        elif UI_STATE == "RUNNING":
+            bx, by, bw, bh = STOP_BTN["x"], STOP_BTN["y"], STOP_BTN["w"], STOP_BTN["h"]
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                STOP_REQUESTED = True
 
 
-def draw_reset_button(img):
-    global RESET_BTN
+def draw_start_button(img):
+    global START_BTN
     H, W = img.shape[:2]
-    margin = 20
-    RESET_BTN["x"] = margin
-    RESET_BTN["y"] = H - RESET_BTN["h"] - margin
+    margin = 15
+    START_BTN["x"] = margin
+    START_BTN["y"] = H - START_BTN["h"] - margin
 
-    x, y, w, h = RESET_BTN["x"], RESET_BTN["y"], RESET_BTN["w"], RESET_BTN["h"]
+    x, y, w, h = START_BTN["x"], START_BTN["y"], START_BTN["w"], START_BTN["h"]
 
-    # Button background + border
-    cv2.rectangle(img, (x, y), (x + w, y + h), (30, 30, 30), -1)
-    cv2.rectangle(img, (x, y), (x + w, y + h), (240, 240, 240), 2)
+    # Green button background + border
+    cv2.rectangle(img, (x, y), (x + w, y + h), (40, 80, 40), -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (100, 255, 100), 2)
+
+    # Label (centered for smaller button)
+    cv2.putText(img, "Start", (x + 18, y + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 255, 100), 2)
+
+
+def draw_stop_button(img):
+    global STOP_BTN
+    H, W = img.shape[:2]
+    margin = 15
+    STOP_BTN["x"] = margin
+    STOP_BTN["y"] = H - STOP_BTN["h"] - margin
+
+    x, y, w, h = STOP_BTN["x"], STOP_BTN["y"], STOP_BTN["w"], STOP_BTN["h"]
+
+    # Red button background + border
+    cv2.rectangle(img, (x, y), (x + w, y + h), (40, 40, 80), -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (100, 100, 255), 2)
 
     # Label
-    cv2.putText(img, "Reset", (x + 35, y + 38),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (240, 240, 240), 2)
+    cv2.putText(img, "Stop", (x + 22, y + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 255), 2)
+
+
+def draw_status_message(img, num_tiles):
+    """Draw the 'Found X tiles' message in READY state."""
+    H, W = img.shape[:2]
+    msg = f"Found {num_tiles} tiles. Press Start and begin matching!"
+
+    # Draw background box for readability
+    text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    text_x = (W - text_size[0]) // 2
+    text_y = H - 70
+
+    padding = 10
+    cv2.rectangle(img,
+                  (text_x - padding, text_y - text_size[1] - padding),
+                  (text_x + text_size[0] + padding, text_y + padding),
+                  (0, 0, 0), -1)
+    cv2.rectangle(img,
+                  (text_x - padding, text_y - text_size[1] - padding),
+                  (text_x + text_size[0] + padding, text_y + padding),
+                  (0, 200, 200), 2)
+
+    cv2.putText(img, msg, (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+
+def draw_confirm_message(img):
+    """Draw the 'Is this correct?' message in CONFIRMING state."""
+    H, W = img.shape[:2]
+    msg = "iPad detected. Is this correct?"
+
+    text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    text_x = (W - text_size[0]) // 2
+    text_y = H - 70
+
+    padding = 10
+    cv2.rectangle(img,
+                  (text_x - padding, text_y - text_size[1] - padding),
+                  (text_x + text_size[0] + padding, text_y + padding),
+                  (0, 0, 0), -1)
+    cv2.rectangle(img,
+                  (text_x - padding, text_y - text_size[1] - padding),
+                  (text_x + text_size[0] + padding, text_y + padding),
+                  (200, 200, 0), 2)
+
+    cv2.putText(img, msg, (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+
+def draw_yes_no_buttons(img):
+    """Draw Yes and No buttons for confirmation."""
+    global YES_BTN, NO_BTN
+    H, W = img.shape[:2]
+    margin = 15
+    gap = 20  # gap between buttons
+
+    # Position buttons side by side at bottom left
+    YES_BTN["x"] = margin
+    YES_BTN["y"] = H - YES_BTN["h"] - margin
+    NO_BTN["x"] = margin + YES_BTN["w"] + gap
+    NO_BTN["y"] = H - NO_BTN["h"] - margin
+
+    # Draw Yes button (green)
+    x, y, w, h = YES_BTN["x"], YES_BTN["y"], YES_BTN["w"], YES_BTN["h"]
+    cv2.rectangle(img, (x, y), (x + w, y + h), (40, 80, 40), -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (100, 255, 100), 2)
+    cv2.putText(img, "Yes", (x + 20, y + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 255, 100), 2)
+
+    # Draw No button (red)
+    x, y, w, h = NO_BTN["x"], NO_BTN["y"], NO_BTN["w"], NO_BTN["h"]
+    cv2.rectangle(img, (x, y), (x + w, y + h), (40, 40, 80), -1)
+    cv2.rectangle(img, (x, y), (x + w, y + h), (100, 100, 255), 2)
+    cv2.putText(img, "No", (x + 24, y + 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 255), 2)
+
+
+def draw_dont_move_warning(img):
+    """Draw warning message after iPad is locked."""
+    H, W = img.shape[:2]
+    msg = "iPad locked! Do not move it."
+
+    text_size = cv2.getTextSize(msg, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
+    text_x = (W - text_size[0]) // 2
+    text_y = 30
+
+    cv2.putText(img, msg, (text_x, text_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
 
 
 if __name__ == "__main__":
@@ -497,139 +649,202 @@ if __name__ == "__main__":
 
         # Default output if we can't produce a warped view yet
         output = np.zeros((360, 640, 3), dtype=np.uint8)
+        warped = None  # Will be set if iPad is detected
         cv2.putText(output, "Point camera at iPad...", (20, 200),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
 
         # Optional debug frame (only shown if DEBUG)
         debug = frame.copy()
 
-        pts = find_screen(frame)
-        if pts is not None:
-            pts = order_points(pts.astype(np.float32))
-            cv2.polylines(debug, [pts.astype(int)], True, (255, 0, 0), 2)  # blue = raw detection
+        # === STATE: CONFIRMING ===
+        # Detect iPad and ask user to confirm before freezing
+        if UI_STATE == "CONFIRMING":
+            pts = find_screen(frame)
+            if pts is not None:
+                pts = order_points(pts.astype(np.float32))
+                cv2.polylines(debug, [pts.astype(int)], True, (255, 0, 0), 2)
 
-        accepted = False
+            accepted = False
 
-        if pts is not None:
-            area = quad_area(pts)
+            if pts is not None:
+                area = quad_area(pts)
 
-            if area > 4000:
-                if last_pts is None:
-                    last_pts = pts
-                    accepted = True
-                else:
-                    last_ord = order_points(last_pts.astype(np.float32))
+                if area > 4000:
+                    if last_pts is None:
+                        last_pts = pts
+                        accepted = True
+                    else:
+                        last_ord = order_points(last_pts.astype(np.float32))
+                        d = iou_like(last_ord, pts)
+                        diag = np.linalg.norm(last_ord[2] - last_ord[0])
+                        jump_thresh = max(60.0, 0.08 * diag)
 
-                    d = iou_like(last_ord, pts)
+                        if d < jump_thresh:
+                            new_diag = quad_diag(pts)
+                            old_diag = quad_diag(last_ord)
+                            scale = new_diag / (old_diag + 1e-6)
 
-                    diag = np.linalg.norm(last_ord[2] - last_ord[0])
-                    jump_thresh = max(60.0, 0.08 * diag)
+                            if 0.92 <= scale <= 1.08:
+                                last_pts = smooth_quad(last_ord, pts, alpha=0.85)
+                                accepted = True
 
-                    if d < jump_thresh:
-                        new_diag = quad_diag(pts)
-                        old_diag = quad_diag(last_ord)
-                        scale = new_diag / (old_diag + 1e-6)
+            if accepted:
+                lost_frames = 0
+            else:
+                lost_frames += 1
+                if lost_frames > MAX_LOST:
+                    last_pts = None
 
-                        if 0.92 <= scale <= 1.08:
-                            last_pts = smooth_quad(last_ord, pts, alpha=0.85)
-                            accepted = True
+            # Show confirmation UI if iPad detected
+            if last_pts is not None:
+                last_ord = order_points(last_pts.astype(np.float32))
+                cv2.polylines(debug, [last_ord.astype(int)], True, (0, 255, 0), 3)
 
-        if accepted:
-            lost_frames = 0
-        else:
-            lost_frames += 1
-            if lost_frames > MAX_LOST:
-                last_pts = None
+                warped = four_point_warp(frame, last_ord)
+                if warped is not None:
+                    output = warped.copy()
+                    cv2.putText(output, "CONFIRMING - Check iPad position",
+                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                    draw_confirm_message(output)
+                    draw_yes_no_buttons(output)
 
-        # If we have a stable iPad quad, generate the main output from warped view
-        if last_pts is not None:
-            last_ord = order_points(last_pts.astype(np.float32))
-            cv2.polylines(debug, [last_ord.astype(int)], True, (0, 255, 0), 3)  # green tracking quad
-
-            warped = four_point_warp(frame, last_ord)
+        # === STATES: SEARCHING, READY, RUNNING ===
+        # Use frozen quad - no more detection jitter
+        elif FROZEN_QUAD is not None:
+            warped = four_point_warp(frame, FROZEN_QUAD)
             if warped is not None:
-                #global LOCKED_BOXES, TILE_BACK_BASELINE, TILE_STATE
-
-                # If we haven't locked boxes yet, detect them now (spirals visible at start of level)
-                if LOCKED_BOXES is None:
-                    boxes, spirals, tile_size = detect_tiles_via_spirals(warped)
-
-                    # Only lock if it looks like a real level (at least 2 tiles)
-                    if len(boxes) >= 2:
-                        LOCKED_BOXES = sanitize_boxes(boxes)
-                        TILE_BACK_BASELINE = init_tile_baseline(warped, LOCKED_BOXES)
-                        TILE_STATE = [False] * len(LOCKED_BOXES)  # False=BACK, True=FRONT
-                        CAPTURE_DELAY.clear()
-                        CAPTURE_DELAY.update({i: 0 for i in range(len(LOCKED_BOXES))})
-
-
-                else:
-                    boxes = LOCKED_BOXES
-
                 output = warped.copy()
-                overlay = output.copy()
-                alpha = 0.70
 
+                # Draw "iPad locked" warning at top
+                draw_dont_move_warning(output)
 
-                # Draw boxes and detect flips if we are locked
-                if LOCKED_BOXES is not None:
+                # === STATE: SEARCHING ===
+                # Look for tiles, transition to READY when found
+                if UI_STATE == "SEARCHING":
+                    if LOCKED_BOXES is None:
+                        boxes, spirals, tile_size = detect_tiles_via_spirals(warped)
+
+                        # Only lock if it looks like a real level (at least 2 tiles)
+                        if len(boxes) >= 2:
+                            LOCKED_BOXES = sanitize_boxes(boxes)
+
+                    # Draw detected tiles (preview)
+                    if LOCKED_BOXES is not None:
+                        for i, b in enumerate(LOCKED_BOXES):
+                            x, y, w, h = map(int, map(round, b))
+                            cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                        cv2.putText(output, f"tiles={len(LOCKED_BOXES)}  (detecting...)",
+                                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                        # Transition to READY
+                        UI_STATE = "READY"
+                    else:
+                        cv2.putText(output, "Looking for tiles (show spirals)...",
+                                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                # === STATE: READY ===
+                # Show tiles and wait for Start button
+                elif UI_STATE == "READY":
+                    # Draw tile boxes (preview only, no tracking)
+                    if LOCKED_BOXES is not None:
+                        for i, b in enumerate(LOCKED_BOXES):
+                            x, y, w, h = map(int, map(round, b))
+                            cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                        cv2.putText(output, f"tiles={len(LOCKED_BOXES)}  READY",
+                                    (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+                        # Draw status message and Start button
+                        draw_status_message(output, len(LOCKED_BOXES))
+                        draw_start_button(output)
+
+                # === STATE: RUNNING ===
+                # Active tile tracking and matching
+                elif UI_STATE == "RUNNING":
                     # Tune these (hysteresis prevents flicker)
-                    BACK_TO_FRONT_DELTA = 6.0
-                    FRONT_TO_BACK_DELTA = 3.5
+                    BACK_TO_FRONT_DELTA = 4.5
+                    FRONT_TO_BACK_DELTA = 3.0
 
                     max_delta = -1e9
                     max_i = -1
                     max_score = 0.0
                     max_base = 0.0
 
+                    # Wait ~0.4s for flip animation (0.29s) + finger to clear
+                    # At 30fps: 12 frames = 0.4s
+                    DELAY_FRAMES = 12
+                    # Minimum score delta to confirm tile is still flipped before capture
+                    CONFIRM_DELTA = 2.5
+
                     for i, b in enumerate(LOCKED_BOXES):
-                        #x, y, w, h = b
                         x, y, w, h = map(int, map(round, b))
-                        # If tile has an identity, paint overlay
+
+                        # If tile has an identity, draw match number
                         if i in TILE_ID:
                             tid = TILE_ID[i]
-                            color = ID_COLOR.get(tid, (0, 255, 0))
-                            cv2.rectangle(overlay, (x, y), (x + w, y + h), color, -1)
+                            # Draw match number prominently in center
+                            label = str(tid)
+                            font = cv2.FONT_HERSHEY_SIMPLEX
+                            font_scale = 1.5
+                            thickness = 3
+                            text_size = cv2.getTextSize(label, font, font_scale, thickness)[0]
+                            text_x = x + (w - text_size[0]) // 2
+                            text_y = y + (h + text_size[1]) // 2
+                            # Black outline for visibility
+                            cv2.putText(output, label, (text_x, text_y), font, font_scale, (0, 0, 0), thickness + 2)
+                            # White number
+                            cv2.putText(output, label, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
 
+                        # Draw tile box for all tiles
+                        cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+                        # Skip flip detection for already-captured tiles
+                        # Their visual state can throw off maxD and baselines
+                        if i in FACE_HASH:
+                            continue
 
                         score = tile_flip_score(warped, b)
                         base = TILE_BACK_BASELINE[i]
 
                         delta = score - base
+                        # Only track maxD for uncaptured tiles
                         if delta > max_delta:
                             max_delta = delta
                             max_i = i
                             max_score = score
                             max_base = base
-                        
-                        DELAY_FRAMES = 4  # put this OUTSIDE the loop if you want, but ok here
 
                         # --- BACK -> FRONT transition ---
                         if TILE_STATE[i] is False and score > base + BACK_TO_FRONT_DELTA:
                             TILE_STATE[i] = True
-                            CAPTURE_DELAY[i] = DELAY_FRAMES  # start delay timer
+                            CAPTURE_DELAY[i] = DELAY_FRAMES
 
                         # --- FRONT -> BACK transition ---
                         if TILE_STATE[i] is True:
-                            # Only allow FRONT -> BACK if we already captured
                             if i in FACE_READY:
                                 if score < base + FRONT_TO_BACK_DELTA:
                                     TILE_STATE[i] = False
                                     FACE_READY.discard(i)
                                     CAPTURE_DELAY[i] = 0
 
-                        # --- If tile is FRONT, count down then capture once ---
-                        if TILE_STATE[i] is True and i not in FACE_READY:
+                        # --- If tile is FRONT, count down then capture ---
+                        if TILE_STATE[i] is True:
                             if CAPTURE_DELAY.get(i, 0) > 0:
                                 CAPTURE_DELAY[i] -= 1
                             else:
+                                # Confirm tile is still showing content (not a false trigger from finger)
+                                if delta < CONFIRM_DELTA:
+                                    # Score dropped - was probably finger or noise, reset
+                                    TILE_STATE[i] = False
+                                    CAPTURE_DELAY[i] = 0
+                                    continue
+
                                 face = crop_tile_face(warped, b)
                                 if face is not None:
                                     FACE_SNAPSHOT[i] = face
                                     FACE_READY.add(i)
 
-                                    # v2b: hash + identity assignment
-                                    #h = dhash64(face)
                                     norm = normalize_face(face)
                                     h = dhash64(norm)
 
@@ -646,17 +861,9 @@ if __name__ == "__main__":
                                         TILE_ID[i] = tid
                                         ID_COLOR[tid] = deterministic_color(tid)
 
-
-
                         # Slowly adapt baseline only when we believe it's BACK
                         if TILE_STATE[i] is False:
                             TILE_BACK_BASELINE[i] = 0.9 * base + 0.1 * score
-
-                        # Draw tile box
-                        #cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        x, y, w, h = map(int, map(round, b))
-                        cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
-
 
                         # If flipped, draw the tile index label
                         if TILE_STATE[i]:
@@ -665,56 +872,68 @@ if __name__ == "__main__":
                             if i in FACE_SNAPSHOT:
                                 cv2.putText(output, "S", (x + w - 25, y + 30),
                                             cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 0), 2)
-                           
-                    cv2.putText(output, f"saved={len(FACE_SNAPSHOT)}",
-                                (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
 
-                    cv2.putText(output, f"maxΔ={max_delta:.1f} tile={max_i} s={max_score:.1f} b={max_base:.1f}",
+                    cv2.putText(output, f"saved={len(FACE_SNAPSHOT)}",
+                                (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+
+                    cv2.putText(output, f"maxD={max_delta:.1f} tile={max_i} s={max_score:.1f} b={max_base:.1f}",
                                 (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-                    cv2.putText(output, f"tiles={len(LOCKED_BOXES)}  locked=YES",
+                    cv2.putText(output, f"tiles={len(LOCKED_BOXES)}  RUNNING",
                                 (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
 
-                    output = cv2.addWeighted(overlay, alpha, output, 1 - alpha, 0)
+                    # Draw Stop button
+                    draw_stop_button(output)
 
-                else:
-                    # Not locked yet (still searching for tiles)
-                    cv2.putText(output, "Looking for tiles (show spirals)...",
-                                (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+        # === Handle Yes button click (confirm iPad position) ===
+        if YES_REQUESTED:
+            YES_REQUESTED = False
+            if UI_STATE == "CONFIRMING" and last_pts is not None:
+                # Freeze the quad - no more detection updates
+                FROZEN_QUAD = order_points(last_pts.astype(np.float32))
+                UI_STATE = "SEARCHING"
 
-                # Draw Reset button
-                draw_reset_button(output)
+        # === Handle No button click (re-detect iPad) ===
+        if NO_REQUESTED:
+            NO_REQUESTED = False
+            if UI_STATE == "CONFIRMING":
+                # Reset detection, stay in CONFIRMING
+                last_pts = None
+                lost_frames = 0
 
+        # === Handle Start button click ===
+        if START_REQUESTED:
+            START_REQUESTED = False
+            if UI_STATE == "READY" and LOCKED_BOXES is not None and warped is not None:
+                # Initialize tracking state when starting
+                TILE_BACK_BASELINE = init_tile_baseline(warped, LOCKED_BOXES)
+                TILE_STATE = [False] * len(LOCKED_BOXES)
+                CAPTURE_DELAY.clear()
+                CAPTURE_DELAY.update({i: 0 for i in range(len(LOCKED_BOXES))})
+                UI_STATE = "RUNNING"
 
-        # Handle reset click (keep the callback dumb; do the work here)
-        if RESET_REQUESTED:
-            RESET_REQUESTED = False
+        # === Handle Stop button click ===
+        if STOP_REQUESTED:
+            STOP_REQUESTED = False
 
-            # Clear future solver state
+            # Clear all state
             solver_state.clear()
-
-            # (Optional) also drop tracking so it reacquires iPad
-            # last_pts = None
-            # lost_frames = 0
-            # UNLOCK tile tracking for next level
             LOCKED_BOXES = None
             TILE_BACK_BASELINE = None
             TILE_STATE = None
             FACE_SNAPSHOT.clear()
             FACE_READY.clear()
-
             FACE_HASH.clear()
             TILE_ID.clear()
             ID_COLOR.clear()
             NEXT_ID["value"] = 1
             CAPTURE_DELAY.clear()
 
-
-
-
-
-            cv2.putText(output, "RESET!", (20, 80),
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+            # Clear frozen quad and go back to CONFIRMING
+            FROZEN_QUAD = None
+            last_pts = None
+            lost_frames = 0
+            UI_STATE = "CONFIRMING"
 
         # Show exactly one window
         cv2.imshow(WINDOW_NAME, output)

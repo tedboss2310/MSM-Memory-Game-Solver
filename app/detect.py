@@ -21,6 +21,7 @@ NO_BTN = {"x": 0, "y": 0, "w": 80, "h": 40}
 
 LOCKED_BOXES = None          # list[(x,y,w,h)] once per level
 TILE_BACK_BASELINE = None    # list[float] baseline score per tile when back side is showing
+TILE_BACK_HASH = {}          # tile_idx -> 64-bit hash of tile's back (spiral) for flip detection
 TILE_STATE = None            # list[bool] True if tile is FRONT
 FACE_SNAPSHOT = {}   # tile_idx -> BGR image crop (face)
 FACE_READY = set()   # tile_idx set for which we've captured face this flip
@@ -62,9 +63,10 @@ def tile_edge_score(warped_bgr, box):
 
 def tile_flip_score(warped_bgr, box, pad_frac=0.10):
     """
-    Calculate flip score using inner portion of tile.
+    Combined score using both brightness variance AND edge detection.
+    This is more robust across different tile brightness levels.
+
     pad_frac=0.10 means 10% padding on each side, using ~80% of the box.
-    This helps when bounding boxes are slightly larger than actual tiles.
     """
     x, y, w, h = box
 
@@ -83,9 +85,24 @@ def tile_flip_score(warped_bgr, box, pad_frac=0.10):
     roi = warped_bgr[y1:y2, x1:x2]
     if roi.size == 0:
         return 0.0
+
+    # 1. Brightness variance score
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     v = hsv[:, :, 2].astype(np.float32)
-    return float(np.std(v))  # higher = more detail/variation
+    variance_score = float(np.std(v))
+
+    # 2. Edge detection score
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    edges = cv2.Canny(gray, 60, 160)
+    edge_score = float(np.mean(edges))
+
+    # Combine both metrics
+    # Variance is typically 10-40, edges typically 5-50
+    # Scale edge score to contribute roughly equally
+    combined = variance_score + (edge_score * 0.3)
+
+    return combined
 
 def crop_tile_face(warped_bgr, box, pad_frac=0.12):
     x, y, w, h = box
@@ -762,20 +779,18 @@ if __name__ == "__main__":
                 # === STATE: RUNNING ===
                 # Active tile tracking and matching
                 elif UI_STATE == "RUNNING":
-                    # Tune these (hysteresis prevents flicker)
-                    BACK_TO_FRONT_DELTA = 4.5
-                    FRONT_TO_BACK_DELTA = 3.0
+                    # Hash-based flip detection thresholds
+                    # Hash distance > FLIP_HASH_THRESHOLD means tile looks different (flipped)
+                    FLIP_HASH_THRESHOLD = 12
+                    # Hash distance < BACK_HASH_THRESHOLD means tile looks like original (back)
+                    BACK_HASH_THRESHOLD = 8
 
-                    max_delta = -1e9
+                    max_hash_dist = 0
                     max_i = -1
-                    max_score = 0.0
-                    max_base = 0.0
 
                     # Wait ~0.4s for flip animation (0.29s) + finger to clear
                     # At 30fps: 12 frames = 0.4s
                     DELAY_FRAMES = 12
-                    # Minimum score delta to confirm tile is still flipped before capture
-                    CONFIRM_DELTA = 2.5
 
                     for i, b in enumerate(LOCKED_BOXES):
                         x, y, w, h = map(int, map(round, b))
@@ -800,30 +815,38 @@ if __name__ == "__main__":
                         cv2.rectangle(output, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
                         # Skip flip detection for already-captured tiles
-                        # Their visual state can throw off maxD and baselines
                         if i in FACE_HASH:
                             continue
 
-                        score = tile_flip_score(warped, b)
-                        base = TILE_BACK_BASELINE[i]
+                        # Compute current hash and compare to baseline
+                        tile_img = crop_tile_face(warped, b)
+                        if tile_img is None:
+                            continue
+                        norm = normalize_face(tile_img)
+                        current_hash = dhash64(norm)
 
-                        delta = score - base
-                        # Only track maxD for uncaptured tiles
-                        if delta > max_delta:
-                            max_delta = delta
+                        # Get baseline hash (spiral back)
+                        if i not in TILE_BACK_HASH:
+                            continue
+                        baseline_hash = TILE_BACK_HASH[i]
+
+                        # Hash distance: higher = more different from baseline
+                        hash_dist = hamming64(current_hash, baseline_hash)
+
+                        # Track max hash distance for debug display
+                        if hash_dist > max_hash_dist:
+                            max_hash_dist = hash_dist
                             max_i = i
-                            max_score = score
-                            max_base = base
 
                         # --- BACK -> FRONT transition ---
-                        if TILE_STATE[i] is False and score > base + BACK_TO_FRONT_DELTA:
+                        if TILE_STATE[i] is False and hash_dist > FLIP_HASH_THRESHOLD:
                             TILE_STATE[i] = True
                             CAPTURE_DELAY[i] = DELAY_FRAMES
 
                         # --- FRONT -> BACK transition ---
                         if TILE_STATE[i] is True:
                             if i in FACE_READY:
-                                if score < base + FRONT_TO_BACK_DELTA:
+                                if hash_dist < BACK_HASH_THRESHOLD:
                                     TILE_STATE[i] = False
                                     FACE_READY.discard(i)
                                     CAPTURE_DELAY[i] = 0
@@ -833,9 +856,9 @@ if __name__ == "__main__":
                             if CAPTURE_DELAY.get(i, 0) > 0:
                                 CAPTURE_DELAY[i] -= 1
                             else:
-                                # Confirm tile is still showing content (not a false trigger from finger)
-                                if delta < CONFIRM_DELTA:
-                                    # Score dropped - was probably finger or noise, reset
+                                # Confirm tile still looks different (not a false trigger)
+                                if hash_dist < FLIP_HASH_THRESHOLD:
+                                    # Hash distance dropped - was probably finger or noise
                                     TILE_STATE[i] = False
                                     CAPTURE_DELAY[i] = 0
                                     continue
@@ -851,7 +874,7 @@ if __name__ == "__main__":
                                     FACE_HASH[i] = h
 
                                     existing = {k: v for k, v in FACE_HASH.items() if k != i}
-                                    matched_tile, dist = match_identity(h, existing, max_dist=10)
+                                    matched_tile, dist = match_identity(h, existing, max_dist=15)
 
                                     if matched_tile is not None and matched_tile in TILE_ID:
                                         TILE_ID[i] = TILE_ID[matched_tile]
@@ -860,10 +883,6 @@ if __name__ == "__main__":
                                         NEXT_ID["value"] += 1
                                         TILE_ID[i] = tid
                                         ID_COLOR[tid] = deterministic_color(tid)
-
-                        # Slowly adapt baseline only when we believe it's BACK
-                        if TILE_STATE[i] is False:
-                            TILE_BACK_BASELINE[i] = 0.9 * base + 0.1 * score
 
                         # If flipped, draw the tile index label
                         if TILE_STATE[i]:
@@ -876,8 +895,8 @@ if __name__ == "__main__":
                     cv2.putText(output, f"saved={len(FACE_SNAPSHOT)}",
                                 (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
-                    cv2.putText(output, f"maxD={max_delta:.1f} tile={max_i} s={max_score:.1f} b={max_base:.1f}",
-                                (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    cv2.putText(output, f"maxHashDist={max_hash_dist} tile={max_i} (threshold={FLIP_HASH_THRESHOLD})",
+                                (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
                     cv2.putText(output, f"tiles={len(LOCKED_BOXES)}  RUNNING",
                                 (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
@@ -910,6 +929,15 @@ if __name__ == "__main__":
                 TILE_STATE = [False] * len(LOCKED_BOXES)
                 CAPTURE_DELAY.clear()
                 CAPTURE_DELAY.update({i: 0 for i in range(len(LOCKED_BOXES))})
+
+                # Compute baseline hash for each tile (spiral back)
+                TILE_BACK_HASH.clear()
+                for i, box in enumerate(LOCKED_BOXES):
+                    tile_img = crop_tile_face(warped, box)
+                    if tile_img is not None:
+                        norm = normalize_face(tile_img)
+                        TILE_BACK_HASH[i] = dhash64(norm)
+
                 UI_STATE = "RUNNING"
 
         # === Handle Stop button click ===
@@ -920,6 +948,7 @@ if __name__ == "__main__":
             solver_state.clear()
             LOCKED_BOXES = None
             TILE_BACK_BASELINE = None
+            TILE_BACK_HASH.clear()
             TILE_STATE = None
             FACE_SNAPSHOT.clear()
             FACE_READY.clear()

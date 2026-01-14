@@ -1,6 +1,6 @@
 # My Singing Monsters Memory Game Solver
 
-![Alt text](/MSM-memory-demo.png "Optional title")
+![Alt text](/MSM-memory-demo.png "Demo")
 
 
 A computer vision-based tool that helps you solve the Memory Game mini-game in My Singing Monsters. Point your webcam at your device, and the solver will track which tiles you've flipped and identify matching pairs.
